@@ -1,0 +1,40 @@
+
+# Environment variables and API credentials
+.env
+.env.*
+!.env.example
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local databases
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Local research outputs
+research/evidence/*
+research/reports/*
+
+# Allow tracked directory placeholders if needed
+!research/evidence/.gitkeep
+!research/reports/.gitkeep
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,46 @@
+
+[project]
+name = "nifty50-investment-advisor"
+version = "0.1.0"
+description = "An educational NIFTY 50 research and human-approved paper-trading assistant built with Deep Agents."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "deepagents",
+    "feedparser",
+    "httpx",
+    "langchain",
+    "langchain-core",
+    "langchain-google-genai",
+    "langchain-groq",
+    "langchain-nvidia-ai-endpoints",
+    "langchain-openai",
+    "pandas",
+    "pydantic",
+    "pydantic-settings",
+    "python-dotenv",
+    "yfinance",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.20,<0.13"]
+build-backend = "uv_build"
+
+[project.scripts]
+nifty50-advisor = "nifty50_investment_advisor.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
