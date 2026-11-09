@@ -42,49 +42,188 @@ DISCLAIMER = (
 INDEX_TICKERS = {"^NSEI", "^NSEBANK", "^BSESN"}
 COMPARISON_MARKET_PERIOD = "1mo"
 COMPARISON_TECHNICAL_PERIOD = "6mo"
-TICKER_PATTERNS: list[tuple[tuple[str, ...], str]] = [
-    (("bank nifty", "nifty bank"), "^NSEBANK"),
-    (("sensex", "bse sensex"), "^BSESN"),
-    (("nifty 50", "nifty50", "nifty"), "^NSEI"),
-    (("reliance industries", "reliance"), "RELIANCE.NS"),
-    (("tata consultancy services", "tcs"), "TCS.NS"),
-    (("infosys",), "INFY.NS"),
-    (("hdfc bank",), "HDFCBANK.NS"),
-    (("icici bank",), "ICICIBANK.NS"),
-    (("bharti airtel", "airtel"), "BHARTIARTL.NS"),
-]
+
+# Short word aliases for well-known constituents. These are checked before the
+# live universe lookup so common short names (e.g. "tcs") keep working even
+# when the official member file cannot be reached.
+TICKER_WORD_ALIASES: dict[str, str] = {
+    "tcs": "TCS",
+    "hdfc": "HDFCBANK",
+    "icici": "ICICIBANK",
+    "airtel": "BHARTIARTL",
+    "sbi": "SBIN",
+    "tatamotors": "TATAMOTORS",
+    "tatamotors passenger vehicles": "TATAMOTORS",
+    "tatamotors pvr": "TATAMOTORS",
+}
+
+# Explicit Yahoo symbol pattern (e.g. RELIANCE.NS, RELIANCE).
+_SYMBOL_RE = re.compile(r"\b([A-Z0-9&-]{1,25})(\.NS)?\b")
+_SYMBOL_EXPLICIT_SUFFIX_RE = re.compile(r"\b[A-Z0-9&-]{1,25}\.NS\b")
+_STOP_WORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "of",
+    "for",
+    "in",
+    "on",
+    "to",
+    "vs",
+}
 
 
-def _report_ticker(question: str) -> str:
-    """Infer a supported index or company ticker from the question."""
+def _universe_symbol_lookup(universe: Nifty50Universe) -> dict[str, str]:
+    """Map normalized names to Yahoo tickers for every current constituent.
+
+    Each constituent registers its symbol, its Yahoo ticker, and its company
+    name with facility prefixes and suffixes removed (e.g. "Tata Motors
+    Passenger Vehicles Limited" also registers "tata motors passenger
+    vehicles"). The first constituent to claim a key keeps it, so the six
+    pre-existing short names are never stolen by another company.
+    """
+    lookup: dict[str, str] = {}
+
+    def _register(key: str, ticker: str) -> None:
+        cleaned = " ".join(key.casefold().split())
+        if cleaned and cleaned not in lookup:
+            lookup[cleaned] = ticker
+
+    for item in universe.constituents:
+        ticker = item.yahoo_ticker
+        _register(item.symbol, ticker)
+        _register(ticker, ticker)
+        _register(item.company_name, ticker)
+        name = item.company_name.lower()
+        for suffix in (" limited", " ltd", " ltd.", " technologies", " technology"):
+            if name.endswith(suffix):
+                _register(name[: -len(suffix)], ticker)
+                break
+        if name.startswith("the "):
+            _register(item.company_name[4:], ticker)
+
+    return lookup
+
+
+def _report_ticker(
+    question: str, universe: Nifty50Universe | None = None
+) -> str:
+    """Infer a supported index or company ticker from the question.
+
+    Resolution order is deterministic: explicit NIFTY 50 company names,
+    explicit index phrases, then any current-universe symbol, Yahoo suffix
+    form, short alias, or company-name words. Exact-symbol matching is always
+    preferred over fuzzy name matching so the LLM is never asked to guess a
+    ticker.
+    """
     normalized = question.casefold()
+    words = {word.strip(".,;:!?()") for word in normalized.split()}
 
-    # Prefer an explicitly named company over a general market reference.
-    company_patterns = TICKER_PATTERNS[3:]
-    index_patterns = TICKER_PATTERNS[:3]
+    # 1. Index phrases (kept ahead of company names: "bank nifty" must not
+    #    match individual banks by substring).
+    if any(phrase in normalized for phrase in ("bank nifty", "nifty bank")):
+        return "^NSEBANK"
+    if any(phrase in normalized for phrase in ("sensex", "bse sensex")):
+        return "^BSESN"
 
-    for patterns, ticker in company_patterns:
-        if any(
-            re.search(rf"\b{re.escape(pattern)}\b", normalized)
-            for pattern in patterns
-        ):
+    # 2. Exact company names for the well-known fixtures.
+    company_names = [
+        ("reliance industries", "RELIANCE.NS"),
+        ("reliance", "RELIANCE.NS"),
+        ("tata consultancy services", "TCS.NS"),
+        ("tata consultancy", "TCS.NS"),
+        ("infosys", "INFY.NS"),
+        ("hdfc bank", "HDFCBANK.NS"),
+        ("icici bank", "ICICIBANK.NS"),
+        ("bharti airtel", "BHARTIARTL.NS"),
+        ("airtel", "BHARTIARTL.NS"),
+        ("tcs", "TCS.NS"),
+    ]
+    for name, ticker in company_names:
+        if name in normalized:
             return ticker
 
-    # Recognize common Yahoo Finance ticker symbols when explicitly supplied.
-    ticker_match = re.search(
-        r"\b(RELIANCE\.NS|TCS\.NS|INFY\.NS|HDFCBANK\.NS|"
-        r"ICICIBANK\.NS|BHARTIARTL\.NS)\b",
-        question,
-        re.IGNORECASE,
-    )
-    if ticker_match:
-        return ticker_match.group(1).upper()
+    # 3. Current-universe lookup (all 50 constituents): by full company name,
+    #    by symbol, and by Yahoo suffixed symbol.
+    current_universe = universe
+    if current_universe is None:
+        try:
+            current_universe = get_nifty50_universe()
+        except RuntimeError:
+            current_universe = None
 
-    for patterns, ticker in index_patterns:
+    if current_universe is not None:
+        lookup = _universe_symbol_lookup(current_universe)
+
+        # 3a. Whole company-name phrase first: "tata motors passenger
+        #     vehicles" is its own constituent name and must beat the
+        #     single-word "tata" fallback below.
+        for item in current_universe.constituents:
+            if item.company_name.casefold() in normalized:
+                return item.yahoo_ticker
+
+        # 3b. Exact Yahoo suffixed symbols (RELIANCE.NS).
+        explicit = _SYMBOL_EXPLICIT_SUFFIX_RE.search(question.upper())
+        if explicit:
+            candidate = explicit.group(0)
+            if candidate in lookup:
+                return lookup[candidate]
+
+        # 3c. Whole-word aliases ("tcs", "hdfc", "sbi", "airtel", ...).
+        for word in words:
+            if word in TICKER_WORD_ALIASES:
+                return f"{TICKER_WORD_ALIASES[word]}.NS"
+
+        # 3d. Multi-word company-name phrases (including the suffix-stripped
+        #     variants in the lookup, e.g. "ashok leyland"), longest first so
+        #     the most specific name wins.
+        multi_word_keys = sorted(
+            (key for key in lookup if " " in key),
+            key=len,
+            reverse=True,
+        )
+        for phrase in multi_word_keys:
+            # Ignore very short names; they risk matching unrelated words.
+            if len(phrase) < 4:
+                continue
+            if phrase in normalized:
+                return lookup[phrase]
+
+        # 3e. Exact symbol word (" reliance " -> RELIANCE.NS via word match).
+        symbol_words = {
+            item.symbol.casefold(): item.yahoo_ticker
+            for item in current_universe.constituents
+        }
+        for word in words:
+            if word in _STOP_WORDS:
+                continue
+            if word in symbol_words:
+                return symbol_words[word]
+
+        # 3f. First distinctive name word ("tatamotors" in "operation
+        #     tata motors passenger vehicles").
+        searchable = " ".join(sorted(words - _STOP_WORDS))
+        for key, ticker in lookup.items():
+            if len(key) < 4 or " " in key:
+                continue
+            if key in searchable.split():
+                return ticker
+
+    # 4. Any explicit Yahoo suffix symbol, even if not in the universe list;
+    #    the market-data tool validates the symbol itself.
+    suffix_match = _SYMBOL_EXPLICIT_SUFFIX_RE.search(question.upper())
+    if suffix_match:
+        return suffix_match.group(0)
+
+    for patterns, ticker in (
+        (("nifty 50", "nifty50", "nifty"), "^NSEI"),
+    ):
         if any(pattern in normalized for pattern in patterns):
             return ticker
 
-    # Broad Indian-market questions default to the NIFTY 50 index.
+    # 5. Broad Indian-market questions default to the NIFTY 50 index.
     general_market_terms = (
         "indian stock market",
         "india stock market",
