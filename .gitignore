@@ -38,3 +38,6 @@ research/reports/*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Agent tooling (local only)
+.zcode/
