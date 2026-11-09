@@ -11,7 +11,6 @@ def test_selected_model_precedence_llm_model_wins():
         llm_provider="groq",
         llm_model="custom-model",
         groq_model="per-provider-model",
-        **{},
     )
     assert settings.selected_model == "custom-model"
 
