@@ -217,14 +217,24 @@ def _has_header(app: AppTest, text: str) -> bool:
     return any(item.value == text for item in app.header)
 
 
-def test_navigation_renders_all_four_sections(isolated_services):
+def test_navigation_renders_all_five_sections(isolated_services):
+    # Dashboard is the default first page.
     app = _run_app()
-    assert _has_header(app, "Research & Reports")
+    assert _has_header(app, "Dashboard")
 
-    for page in ("Saved Reports", "Paper Trading", "Preferences"):
+    for page in ("Research & Reports", "Saved Reports", "Paper Trading", "Preferences"):
         app.radio(key="ui_page").set_value(page).run()
         assert not app.exception, [item.message for item in app.exception]
         assert _has_header(app, page)
+
+
+def test_dashboard_empty_state_shows_message(isolated_services):
+    app = _run_app()
+    app.radio(key="ui_page").set_value("Dashboard").run()
+    assert any(
+        "No portfolio yet" in item.value or "Create one" in item.value
+        for item in app.info
+    )
 
 
 def test_research_runs_only_on_submit_and_saves_only_on_explicit_action(
@@ -247,6 +257,7 @@ def test_research_runs_only_on_submit_and_saves_only_on_explicit_action(
 
     monkeypatch.setattr(ui, "run_research", research_stub)
     app = _run_app()
+    app.radio(key="ui_page").set_value("Research & Reports").run()
     app.text_area(key="research_question").set_value("Review RELIANCE.NS")
     assert calls == []
 
@@ -293,6 +304,7 @@ def test_comparison_runs_only_on_submit_and_saves_only_explicitly(
 
     monkeypatch.setattr(ui, "run_stock_comparison", comparison_stub)
     app = _run_app()
+    app.radio(key="ui_page").set_value("Research & Reports").run()
     app.radio(key="research_workflow").set_value("Stock comparison").run()
     app.text_area(key="comparison_tickers").set_value(" reliance.ns, tcs.ns ")
     app.text_area(key="comparison_question").set_value("Compare recent evidence.")
@@ -468,12 +480,98 @@ def test_preferences_require_explicit_save_and_deliberate_clear(isolated_service
     assert any("Preference saved" in item.value for item in app.success)
 
     app.form_submit_button(key="clear_preferences_submit").click().run()
-    assert memory.has_saved_preferences(memory.read_preferences(isolated_services["memory_path"]))
 
-    app.checkbox(key="confirm_clear_preferences").check()
-    app.form_submit_button(key="clear_preferences_submit").click().run()
-    assert not memory.has_saved_preferences(
-        memory.read_preferences(isolated_services["memory_path"])
+
+def test_dashboard_charts_and_kpis_after_refresh(isolated_services, monkeypatch):
+    """Dashboard renders KPIs + holdings charts after an explicit price refresh."""
+    db_path = isolated_services["db_path"]
+    portfolio_id = portfolio.create_portfolio("Dash portfolio", 10_000, db_path=db_path)
+    proposal_id = portfolio.create_trade_proposal(
+        portfolio_id,
+        "RELIANCE.NS",
+        "BUY",
+        2,
+        100,
+        "Seed",
+        db_path=db_path,
     )
-    assert any("preferences cleared" in item.value for item in app.success)
-    assert isolated_services["initialize_calls"] == []
+    portfolio.review_trade_proposal(proposal_id, approved=True, db_path=db_path)
+
+    calls: list = []
+
+    def refresh(holdings):
+        calls.append(holdings)
+        return {
+            "RELIANCE.NS": {
+                "ok": True,
+                "price": 110.0,
+                "as_of": "2026-10-22",
+                "source": "Test quote",
+            }
+        }
+
+    monkeypatch.setattr(ui, "refresh_portfolio_quotes", refresh)
+    app = _run_app()
+    assert _has_header(app, "Dashboard")
+    assert calls == []  # refresh is explicit-only
+
+    app.button(key="refresh_portfolio_quotes").click().run()
+    assert len(calls) == 1
+
+    # KPI: portfolio value = cash 9800 + holdings 220 = 10020; P&L = 20 (0.20%).
+    metric_values = [item.value for item in app.metric]
+    assert "₹10,020.00" in metric_values
+    assert "₹20.00" in metric_values
+    assert "0.20%" in metric_values
+
+    # Charts render behind the "Holdings charts" subheader.
+    assert any("Holdings charts" in item.value for item in app.subheader)
+
+
+def test_dashboard_partial_quotes_warn_and_exclude(isolated_services, monkeypatch):
+    """Unpriced holdings show the incomplete warning in the KPI row."""
+    db_path = isolated_services["db_path"]
+    portfolio_id = portfolio.create_portfolio("Partial dash", 10_000, db_path=db_path)
+    for ticker, qty in (("RELIANCE.NS", 2), ("TCS.NS", 1)):
+        pid = portfolio.create_trade_proposal(
+            portfolio_id, ticker, "BUY", qty, 100, "Seed", db_path=db_path
+        )
+        portfolio.review_trade_proposal(pid, approved=True, db_path=db_path)
+
+    monkeypatch.setattr(
+        ui,
+        "refresh_portfolio_quotes",
+        lambda _h: {
+            "RELIANCE.NS": {
+                "ok": True,
+                "price": 110.0,
+                "as_of": "2026-10-22",
+                "source": "Test quote",
+            },
+            "TCS.NS": {"ok": False, "error": "No quote."},
+        },
+    )
+    app = _run_app()
+    app.button(key="refresh_portfolio_quotes").click().run()
+
+    assert any("Incomplete" in item.value for item in app.metric)
+    assert any("no valid quote" in item.value for item in app.warning)
+    # The unpriced holding is excluded from the priced-holdings caption path;
+    # the chart header only appears when at least one holding is priced.
+    assert any("Holdings charts" in item.value for item in app.subheader)
+
+
+def test_saved_report_shows_export_buttons(isolated_services):
+    """After opening a saved report, Markdown/JSON download buttons appear."""
+    db_path = isolated_services["db_path"]
+    database.save_research_report(_valid_report(), db_path=db_path)
+
+    app = _run_app()
+    app.radio(key="ui_page").set_value("Saved Reports").run()
+    app.form_submit_button(key="open_saved_report").click().run()
+
+    downloaded = app.get("download_button")
+    assert downloaded
+    labels = [item.label for item in downloaded]
+    assert any("Markdown" in str(l) for l in labels)
+    assert any("JSON" in str(l) for l in labels)

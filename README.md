@@ -138,11 +138,14 @@ Start the local interface from the project directory with:
 
     uv run streamlit run src/nifty50_investment_advisor/ui.py --server.address 127.0.0.1
 
-The interface has Research & Reports (single-stock and Stock comparison),
-Saved Reports, Paper Trading, and Preferences sections. Research runs after
+The interface has five sections: **Dashboard** (portfolio KPIs, saved-report
+counts, and cost-vs-value / unrealized-P&L charts for priced holdings),
+Research & Reports (single-stock and Stock comparison), Saved Reports, Paper
+Trading, and Preferences. Research runs after
 form submission and successful reports are saved only after an explicit save
 action. Saved Reports identifies comparison records separately and can reopen
-them. Comparison supports the current NIFTY 50 constituent list and displays a
+them; any opened or freshly generated report can be downloaded as Markdown
+or JSON (Markdown is the human-readable format; JSON is the faithful archive). Comparison supports the current NIFTY 50 constituent list and displays a
 deterministic summary plus differences only for metrics returned for multiple
 tickers. In Paper Trading, refresh prices explicitly to view last returned
 daily closes, per-holding unrealized P&L, realized P&L, and total return. The

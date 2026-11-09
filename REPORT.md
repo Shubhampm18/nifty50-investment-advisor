@@ -355,6 +355,28 @@ database itself refuses to record the same proposal twice. Bypass any one and th
 hold. That is what a real approval gate is — a capability the model does not have, backed by
 constraints the database enforces — not a rule it was asked to follow.
 
+### 5.8 The UI layer — dashboard, charts, and export
+
+The Streamlit interface has five pages: **Dashboard**, Research & Reports, Saved Reports,
+Paper Trading, and Preferences. The Dashboard focuses only on a single portfolio at a glance —
+cash, portfolio value, total P&L, total return, realized P&L, holdings count — plus counts of
+saved reports, saved comparisons, and pending proposals. Charts use Streamlit's native
+`bar_chart` (backed by pandas, which is already a dependency) to show cost basis vs market
+value and unrealized P&L per holding.
+
+The quote refresh on the Dashboard and Paper Trading pages shares one session-state cache
+(`portfolio_quotes_{id}`), so refreshing prices on one page instantly updates the other —
+one explicit action per portfolio, either page. Holdings without a valid quote are excluded
+from charts with a caption rather than plotted as zero; the "Incomplete" valuation warning
+from `build_portfolio_valuation` is preserved. No portfolio-value history is persisted, so
+there is deliberately no performance-over-time chart.
+
+Saved research reports and comparisons can be exported as Markdown (human-readable, mirroring
+what the UI renders) or JSON (the faithful archive of the exact saved payload). Export uses
+pure string formatting over the already-JSON-safe `get_*` dicts — no new dependencies, no PDF
+library — and is offered both on the Saved Reports page and next to Save on fresh research
+and comparison runs. Comparison export preserves the deterministic no-winner semantics.
+
 ## 6. Action, Reasoning, Memory
 
 **Action.** The most important decision was limiting it. The agent can call four read-only tools,

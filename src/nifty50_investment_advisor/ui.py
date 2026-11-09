@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import pandas as pd
 import streamlit as st
 
 from nifty50_investment_advisor.database import (
@@ -38,8 +39,15 @@ from nifty50_investment_advisor.portfolio_valuation import (
     build_portfolio_valuation,
     refresh_portfolio_quotes,
 )
+from nifty50_investment_advisor.report_export import (
+    export_comparison_markdown,
+    export_filename,
+    export_report_json,
+    export_report_markdown,
+)
 
 PAGES = (
+    "Dashboard",
     "Research & Reports",
     "Saved Reports",
     "Paper Trading",
@@ -221,6 +229,7 @@ def _research_page() -> None:
                 st.error(f"Could not save the report ({type(exc).__name__}).")
             else:
                 st.success(f"Report saved with ID {st.session_state['saved_report_id']}.")
+        _export_report_buttons(report, report_id=saved_id, is_comparison=False, suffix="fresh")
 
 
 def _show_comparison_report(report: dict[str, Any]) -> None:
@@ -379,6 +388,39 @@ def _comparison_page() -> None:
                 st.success(
                     f"Comparison saved with ID {st.session_state['saved_comparison_id']}."
                 )
+        _export_report_buttons(
+            report, report_id=saved_id, is_comparison=True, suffix="fresh-comparison"
+        )
+
+
+def _export_report_buttons(
+    report: dict[str, Any],
+    *,
+    report_id: int | None,
+    is_comparison: bool,
+    suffix: str,
+) -> None:
+    """Render Markdown + JSON download buttons for a report payload."""
+    st.subheader("Export report")
+    markdown = (
+        export_comparison_markdown(report)
+        if is_comparison
+        else export_report_markdown(report)
+    )
+    st.download_button(
+        "Download Markdown",
+        data=markdown,
+        file_name=export_filename(report, report_id=report_id, fmt="md"),
+        mime="text/markdown",
+        key=f"export_md_{suffix}_{report_id}",
+    )
+    st.download_button(
+        "Download JSON",
+        data=export_report_json(report),
+        file_name=export_filename(report, report_id=report_id, fmt="json"),
+        mime="application/json",
+        key=f"export_json_{suffix}_{report_id}",
+    )
 
 
 def _saved_reports_page() -> None:
@@ -472,11 +514,144 @@ def _saved_reports_page() -> None:
             _show_comparison_report(opened_report)
         else:
             _show_report(opened_report)
+        _export_report_buttons(
+            opened_report,
+            report_id=st.session_state.get("opened_report_id"),
+            is_comparison=st.session_state.get("opened_report_type") == "comparison",
+            suffix="saved",
+        )
 
 
 def _format_portfolio(portfolio_id: int, portfolios: dict[int, dict[str, Any]]) -> str:
     item = portfolios[portfolio_id]
     return f"#{portfolio_id} · {item['name']} · ₹{item['cash_balance']:,.2f} cash"
+
+
+def _priced_holdings_frame(
+    valuation: dict[str, Any],
+) -> tuple[pd.DataFrame, int]:
+    """Build the priced-only holdings frame used for charts.
+
+    Holdings without a valid quote are excluded (never coerced to zero) and
+    counted so the UI can caption the exclusion.
+    """
+    priced = [
+        holding
+        for holding in valuation.get("holdings", [])
+        if holding.get("market_value") is not None
+    ]
+    excluded = len(valuation.get("holdings", [])) - len(priced)
+    if not priced:
+        return pd.DataFrame(), excluded
+    frame = pd.DataFrame(priced).set_index("ticker")[
+        ["cost_basis", "market_value", "unrealized_pnl"]
+    ]
+    return frame, excluded
+
+
+def _holding_charts(valuation: dict[str, Any]) -> None:
+    """Render cost-vs-value and unrealized-P&L bar charts for priced holdings."""
+    frame, excluded = _priced_holdings_frame(valuation)
+    if frame.empty:
+        if excluded:
+            st.caption(
+                f"{excluded} holding(s) without a valid quote are excluded from charts."
+            )
+        else:
+            st.caption("No priced holdings yet; refresh prices to chart holdings.")
+        return
+
+    st.subheader("Holdings charts")
+    st.caption(
+        "Cost basis vs market value and unrealized P&L per holding (priced holdings only)."
+    )
+    st.bar_chart(frame[["cost_basis", "market_value"]], stack=False)
+    st.bar_chart(frame[["unrealized_pnl"]], stack=False)
+
+
+def _dashboard_page() -> None:
+    """Compact overview: KPIs, library counts, and holdings charts."""
+    st.header("Dashboard")
+    st.caption("A compact view of the paper portfolio and saved research library.")
+
+    try:
+        portfolio_rows = list_portfolios()
+        reports_count = len(list_research_reports(limit=100))
+        comparisons_count = len(list_stock_comparisons(limit=100))
+        pending_count = len(list_trade_proposals(status="PENDING", limit=100))
+    except Exception as exc:  # noqa: BLE001 - show a safe retrieval error
+        st.error(f"Could not load dashboard ({type(exc).__name__}).")
+        return
+
+    counts = st.columns(4)
+    counts[0].metric("Portfolios", len(portfolio_rows))
+    counts[1].metric("Saved reports", reports_count)
+    counts[2].metric("Saved comparisons", comparisons_count)
+    counts[3].metric("Pending proposals", pending_count)
+
+    if not portfolio_rows:
+        st.info(
+            "No portfolio yet. Create one on the Paper Trading page, then "
+            "research a stock and save its report here."
+        )
+        return
+
+    portfolios = {int(item["id"]): item for item in portfolio_rows}
+    portfolio_id = st.selectbox(
+        "Portfolio",
+        options=list(portfolios),
+        format_func=lambda value: _format_portfolio(value, portfolios),
+        key="dashboard_portfolio_choice",
+    )
+
+    try:
+        summary = get_portfolio_summary(portfolio_id)
+    except Exception as exc:  # noqa: BLE001 - show a safe portfolio error
+        st.error(f"Could not load portfolio summary ({type(exc).__name__}).")
+        return
+
+    metrics = st.columns(4)
+    metrics[0].metric("Cash balance", f"₹{summary['cash_balance']:,.2f}")
+    metrics[1].metric("Initial cash", f"₹{summary['initial_cash']:,.2f}")
+    metrics[2].metric("Realized P&L", f"₹{summary['realized_pnl']:,.2f}")
+    metrics[3].metric("Holdings", summary["holdings_count"])
+
+    st.subheader("Portfolio valuation")
+    st.caption(
+        "Refresh retrieves the latest daily close returned by Yahoo Finance; "
+        "it is not guaranteed live exchange data. Totals are shown only when "
+        "every holding has a valid returned price."
+    )
+    quote_state_key = f"portfolio_quotes_{portfolio_id}"
+    if st.button("Refresh holding prices", key="refresh_portfolio_quotes"):
+        st.session_state[quote_state_key] = refresh_portfolio_quotes(
+            summary["holdings"]
+        )
+    quotes = st.session_state.get(quote_state_key, {})
+    valuation = build_portfolio_valuation(summary, quotes)
+    total_value = valuation["total_value"]
+    total_pnl = valuation["total_pnl"]
+    total_return = valuation["total_return_percent"]
+    valuation_metrics = st.columns(4)
+    valuation_metrics[0].metric(
+        "Portfolio value",
+        f"₹{total_value:,.2f}" if total_value is not None else "Incomplete",
+    )
+    valuation_metrics[1].metric(
+        "Total P&L",
+        f"₹{total_pnl:,.2f}" if total_pnl is not None else "Incomplete",
+    )
+    valuation_metrics[2].metric(
+        "Total return",
+        f"{total_return:.2f}%" if total_return is not None else "Unavailable",
+    )
+    valuation_metrics[3].metric("Holdings", summary["holdings_count"])
+    if not valuation["valuation_complete"]:
+        st.warning(
+            "At least one holding has no valid quote. The displayed known-value "
+            "subtotal is partial and is not used to calculate total P&L or return."
+        )
+    _holding_charts(valuation)
 
 
 def _paper_trading_page() -> None:
@@ -581,6 +756,7 @@ def _paper_trading_page() -> None:
         )
     if valuation["holdings"]:
         st.dataframe(valuation["holdings"], hide_index=True, width="stretch")
+        _holding_charts(valuation)
     else:
         st.caption("No holdings in this portfolio; value equals the cash balance.")
 
@@ -820,7 +996,9 @@ def main() -> None:
     st.caption("Evidence-led research · private preferences · simulated paper trading")
 
     page = st.sidebar.radio("Workspace", options=PAGES, key="ui_page")
-    if page == "Research & Reports":
+    if page == "Dashboard":
+        _dashboard_page()
+    elif page == "Research & Reports":
         _research_page()
     elif page == "Saved Reports":
         _saved_reports_page()
