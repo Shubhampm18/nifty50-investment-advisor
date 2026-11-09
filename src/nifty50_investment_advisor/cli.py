@@ -10,8 +10,10 @@ from typing import Any
 
 from nifty50_investment_advisor.database import (
     get_research_report,
+    get_stock_comparison,
     initialize_database,
     list_research_reports,
+    list_stock_comparisons,
     save_research_report,
     save_stock_comparison,
 )
@@ -30,6 +32,10 @@ from nifty50_investment_advisor.portfolio import (
     list_portfolios,
     list_trade_proposals,
     review_trade_proposal,
+)
+from nifty50_investment_advisor.portfolio_valuation import (
+    build_portfolio_valuation,
+    refresh_portfolio_quotes,
 )
 from nifty50_investment_advisor.research import (
     run_research,
@@ -74,6 +80,11 @@ def _add_portfolio_commands(subparsers: Any) -> None:
         "portfolio_id",
         type=int,
         help="ID of the portfolio to display.",
+    )
+    show_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Also fetch last returned closes and show market value and unrealized P&L.",
     )
 
     research_parser = subparsers.add_parser(
@@ -133,6 +144,27 @@ def _add_portfolio_commands(subparsers: Any) -> None:
         "report_id",
         type=int,
         help="ID of the saved research report.",
+    )
+
+    comparison_list_parser = subparsers.add_parser(
+        "comparison-list",
+        help="List saved stock comparisons.",
+    )
+    comparison_list_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum comparisons to display (1-500).",
+    )
+
+    comparison_show_parser = subparsers.add_parser(
+        "comparison-show",
+        help="Display a saved stock comparison.",
+    )
+    comparison_show_parser.add_argument(
+        "comparison_id",
+        type=int,
+        help="ID of the saved stock comparison.",
     )
     
     # Create a paper-trade proposal (does not execute a trade).
@@ -342,7 +374,12 @@ def main() -> None:
             summary = get_portfolio_summary(args.portfolio_id)
             if summary is None:
                 parser.error(f"Portfolio {args.portfolio_id} was not found.")
-            _print_json(summary)
+            if args.refresh:
+                quotes = refresh_portfolio_quotes(summary["holdings"])
+                valuation = build_portfolio_valuation(summary, quotes)
+                _print_json({**summary, **valuation})
+            else:
+                _print_json(summary)
         except (ValueError, TypeError) as exc:
             parser.error(str(exc))
 
@@ -371,6 +408,28 @@ def main() -> None:
             parser.error(str(exc))
         except Exception as exc:
             parser.error(f"Could not retrieve research report: {exc}")
+
+    elif args.command == "comparison-list":
+        try:
+            comparisons = list_stock_comparisons(limit=args.limit)
+            _print_json(comparisons)
+        except (ValueError, TypeError) as exc:
+            parser.error(str(exc))
+        except Exception as exc:
+            parser.error(f"Could not list stock comparisons: {exc}")
+
+    elif args.command == "comparison-show":
+        try:
+            comparison = get_stock_comparison(args.comparison_id)
+            if comparison is None:
+                parser.error(
+                    f"Stock comparison {args.comparison_id} was not found."
+                )
+            _print_json(comparison)
+        except (ValueError, TypeError) as exc:
+            parser.error(str(exc))
+        except Exception as exc:
+            parser.error(f"Could not retrieve stock comparison: {exc}")
             
 
     elif args.command == "research":

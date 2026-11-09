@@ -167,6 +167,10 @@ def initialize_database(db_path: str | Path | None = None) -> None:
                 "ALTER TABLE trade_proposals ADD COLUMN "
                 "transaction_cost_bps REAL NOT NULL DEFAULT 0"
             )
+        if "expires_at" not in proposal_columns:
+            connection.execute(
+                "ALTER TABLE trade_proposals ADD COLUMN expires_at TEXT"
+            )
 
         trade_columns = {
             row["name"]

@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -21,6 +21,8 @@ from nifty50_investment_advisor.database import (
 
 DEFAULT_INITIAL_CASH = DEFAULT_INITIAL_PAPER_CASH
 DEFAULT_PORTFOLIO_NAME = "My NIFTY 50 Portfolio"
+DEFAULT_PROPOSAL_EXPIRY_DAYS = 7
+PROPOSAL_EXPIRY_WARNING_THRESHOLD_DAYS = 1
 
 
 def get_default_initial_cash() -> float:
@@ -57,6 +59,45 @@ def _transaction_cost_bps(value: float) -> float:
     if not math.isfinite(rate) or not 0 <= rate <= 10_000:
         raise ValueError("Transaction cost must be a number from 0 to 10,000 bps.")
     return rate
+
+
+def _parse_stored_datetime(value: str | None) -> datetime | None:
+    """Parse an ISO timestamp written by ``_now()`` back to a datetime."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _proposal_expiry(expiry_days: int) -> tuple[str, str]:
+    """Return (expires_at, created_at) for a new proposal."""
+    now = datetime.now(UTC)
+    expires = now + timedelta(days=expiry_days)
+    return expires.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")
+
+
+def _expiry_status(proposal) -> tuple[bool, str | None]:
+    """Check whether a proposal has passed its expiry timestamp.
+
+    Proposals without an ``expires_at`` (older databases) are treated as
+    non-expiring until the column exists; never block them.
+    """
+    expires_at = None
+    try:
+        expires_at = proposal["expires_at"]  # type: ignore[operator]
+    except (KeyError, IndexError, TypeError):
+        return False, None
+    expires = _parse_stored_datetime(expires_at)
+    if expires is None:
+        return False, None
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    now = datetime.now(UTC)
+    if now > expires:
+        return True, f"Proposal expired at {expires.isoformat(timespec='seconds')}."
+    return False, None
 
 
 def _clean_ticker(ticker: str) -> str:
@@ -170,12 +211,15 @@ def create_trade_proposal(
     research_report_id: int | None = None,
     db_path: str | Path | None = None,
     transaction_cost_bps: float = 0.0,
+    expiry_days: int | None = None,
 ) -> int:
     """
     Submit a pending proposal. This function never executes a trade.
 
     A human must explicitly approve the proposal through
     review_trade_proposal() before cash or holdings can change.
+    Proposals carry an ``expires_at`` timestamp (default 7 days); approval
+    after that deadline is rejected.
     """
     ticker = _clean_ticker(ticker)
     side = side.strip().upper() if isinstance(side, str) else ""
@@ -185,6 +229,11 @@ def create_trade_proposal(
     quantity = _positive_integer(quantity, "Quantity")
     proposed_price = _positive_amount(proposed_price, "Proposed price")
     transaction_cost_bps = _transaction_cost_bps(transaction_cost_bps)
+
+    days = DEFAULT_PROPOSAL_EXPIRY_DAYS if expiry_days is None else _positive_integer(
+        expiry_days, "Expiry days"
+    )
+    expires_at, _created_at = _proposal_expiry(days)
 
     if not isinstance(rationale, str) or not rationale.strip():
         raise ValueError("A non-empty rationale is required.")
@@ -231,9 +280,9 @@ def create_trade_proposal(
             INSERT INTO trade_proposals (
                 portfolio_id, ticker, side, quantity, proposed_price,
                 transaction_cost_bps, status, rationale, research_report_id,
-                created_at
+                expires_at, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
             """,
             (
                 portfolio_id,
@@ -244,6 +293,7 @@ def create_trade_proposal(
                 transaction_cost_bps,
                 rationale.strip(),
                 research_report_id,
+                expires_at,
                 _now(),
             ),
         )
@@ -324,6 +374,15 @@ def review_trade_proposal(
             raise ValueError(
                 f"Proposal {proposal_id} has already been reviewed."
             )
+
+        if approved:
+            expired, expiry_message = _expiry_status(proposal)
+            if expired:
+                raise ValueError(
+                    f"Proposal {proposal_id} has expired and cannot be approved "
+                    f"({expiry_message}) Reject it or create a fresh proposal "
+                    "at a current price."
+                )
 
         reviewed_at = _now()
 
