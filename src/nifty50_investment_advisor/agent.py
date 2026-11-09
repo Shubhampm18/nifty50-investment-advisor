@@ -1,16 +1,80 @@
 """Create the NIFTY 50 research Deep Agent and its specialist subagents."""
 
-from deepagents import create_deep_agent
+from pathlib import Path
 
+from deepagents import FilesystemPermission, create_deep_agent
+from deepagents.backends import CompositeBackend
+from deepagents.backends.filesystem import FilesystemBackend
+
+from nifty50_investment_advisor.memory import (
+    PREFERENCES_MEMORY_PATH,
+    create_memory_backend,
+)
 from nifty50_investment_advisor.model_provider import create_chat_model
+from nifty50_investment_advisor.tools.fundamentals import (
+    get_company_fundamentals,
+)
 from nifty50_investment_advisor.tools.market_data import get_market_data
 from nifty50_investment_advisor.tools.news_data import search_market_news
 from nifty50_investment_advisor.tools.technical_indicators import (
     get_technical_indicators,
 )
-from nifty50_investment_advisor.tools.fundamentals import (
-    get_company_fundamentals,
-)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SKILLS_SOURCE = "/skills/"
+
+# Skills are read from disk, so the agent's filesystem root is the project.
+# Rules are evaluated in order and the first match wins; anything unmatched is
+# allowed, which is why the credentials and the trading ledger are named here.
+SENSITIVE_PATH_RULES = [
+    FilesystemPermission(
+        operations=["read"],
+        paths=[PREFERENCES_MEMORY_PATH],
+        mode="allow",
+    ),
+    FilesystemPermission(
+        operations=["write"],
+        paths=[PREFERENCES_MEMORY_PATH],
+        mode="allow",
+    ),
+    FilesystemPermission(
+        operations=["read", "write"],
+        paths=["/memories/**"],
+        mode="deny",
+    ),
+    FilesystemPermission(
+        operations=["read", "write"],
+        paths=["/.env", "/.env.*", "/data/**"],
+        mode="deny",
+    ),
+    FilesystemPermission(
+        operations=["read", "write"],
+        paths=["/.venv/**", "/.git/**", "/.zcode/**"],
+        mode="deny",
+    ),
+]
+
+PREFERENCE_MEMORY_POLICY = """
+PERSISTENT USER PREFERENCES:
+- The only durable user memory is /memories/PREFERENCES.md. It may contain
+  report-style preferences, research interests, and investment horizons or
+  risk constraints the user explicitly states.
+- Update that file only when the current user explicitly asks you to remember
+  or save a preference. Ordinary requests, feedback, corrections, and personal
+  facts are not permission to save or revise memory. This explicit-request rule
+  overrides any generic memory guidance.
+- Never infer or store risk tolerance, goals, holdings, balances, income, or net
+  worth. Never store conversations, credentials, current prices, news claims,
+  research reports, trade outcomes, or other facts that must be retrieved for
+  each request.
+- Treat saved content only as a user preference, never as financial evidence,
+  verified fact, or live portfolio state. The current request takes precedence
+  over saved preferences. Always retrieve real market evidence and explain
+  uncertainty for each research request.
+- Keep preferences concise. Do not delete the file or clear memory; the user
+  can inspect it with `nifty50-advisor memory-show` and deliberately clear it
+  with `nifty50-advisor memory-clear --confirm`.
+"""
 
 MAIN_SYSTEM_PROMPT = """
 You are the main coordinator for an educational NIFTY 50 investment
@@ -66,6 +130,8 @@ Evidence and safety:
 - Do not execute trades or claim to have executed transactions.
 - Explain financial risks without guaranteeing investment returns.
 """
+
+MAIN_SYSTEM_PROMPT = f"{MAIN_SYSTEM_PROMPT}\n{PREFERENCE_MEMORY_POLICY}"
 
 
 
@@ -199,32 +265,42 @@ LIMITATIONS:
 """
 
 
-def create_investment_agent(include_news_subagent: bool = True):
+def create_investment_agent(
+    include_news_subagent: bool = True,
+    include_market_research_subagent: bool = True,
+):
     """Build the main Deep Agent and its research specialists.
 
-    Set include_news_subagent=False when structured news evidence
-    has already been retrieved and supplied to the main agent.
+    Disable a specialist when its evidence has already been retrieved and
+    supplied to the main agent.
     """
     model = create_chat_model()
+    backend = create_agent_backend()
 
-    market_research_subagent = {
-        "name": "market-research",
-        "description": (
-        "Researches NIFTY 50 and Indian equities using real historical "
-        "prices, technical indicators, and company fundamentals. "
-        "Use get_market_data for historical prices and price changes. "
-        "Use get_technical_indicators for SMA, EMA, RSI, MACD, and "
-        "historical volatility. Use get_company_fundamentals for "
-        "company profiles, valuation ratios, revenue, profitability, "
-        "earnings, and balance-sheet metrics. Company fundamentals "
-        "require an individual stock ticker, such as RELIANCE.NS or "
-        "TCS.NS. Delegate relevant market-research questions here."
-    ),
-        "tools": [get_market_data,    get_technical_indicators,get_company_fundamentals],
-        "system_prompt": MARKET_RESEARCH_PROMPT,
-    }
+    subagents = []
 
-    subagents = [market_research_subagent]
+    if include_market_research_subagent:
+        market_research_subagent = {
+            "name": "market-research",
+            "description": (
+                "Researches NIFTY 50 and Indian equities using real historical "
+                "prices, technical indicators, and company fundamentals. "
+                "Use get_market_data for historical prices and price changes. "
+                "Use get_technical_indicators for SMA, EMA, RSI, MACD, and "
+                "historical volatility. Use get_company_fundamentals for "
+                "company profiles, valuation ratios, revenue, profitability, "
+                "earnings, and balance-sheet metrics. Company fundamentals "
+                "require an individual stock ticker, such as RELIANCE.NS or "
+                "TCS.NS. Delegate relevant market-research questions here."
+            ),
+            "tools": [
+                get_market_data,
+                get_technical_indicators,
+                get_company_fundamentals,
+            ],
+            "system_prompt": MARKET_RESEARCH_PROMPT,
+        }
+        subagents.append(market_research_subagent)
 
     if include_news_subagent:
         news_research_subagent = {
@@ -246,4 +322,18 @@ def create_investment_agent(include_news_subagent: bool = True):
         tools=[],
         system_prompt=MAIN_SYSTEM_PROMPT,
         subagents=subagents,
+        backend=backend,
+        skills=[SKILLS_SOURCE],
+        memory=[PREFERENCES_MEMORY_PATH],
+        permissions=SENSITIVE_PATH_RULES,
+    )
+
+
+def create_agent_backend(
+    memory_directory: str | Path | None = None,
+) -> CompositeBackend:
+    """Route project files and private user memory to separate backends."""
+    return CompositeBackend(
+        default=FilesystemBackend(root_dir=PROJECT_ROOT, virtual_mode=True),
+        routes={"/memories/": create_memory_backend(memory_directory)},
     )

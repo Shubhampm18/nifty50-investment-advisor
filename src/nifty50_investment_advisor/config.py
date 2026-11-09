@@ -17,8 +17,30 @@ DEFAULT_MODELS: dict[ProviderName, str] = {
 }
 
 
-class Settings(BaseSettings):
-    """Application settings sourced from environment variables or .env."""
+DEFAULT_INITIAL_PAPER_CASH = 100_000.00
+
+
+def _project_root() -> Path:
+    """Return the repository root independently of the caller's cwd."""
+    return Path(__file__).resolve().parents[2]
+
+
+class PersistenceSettings(BaseSettings):
+    """Storage settings that can be loaded without configuring an LLM."""
+
+    model_config = SettingsConfigDict(
+        env_file=None,
+        env_ignore_empty=True,
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    initial_paper_cash: float = Field(default=DEFAULT_INITIAL_PAPER_CASH, gt=0)
+    database_path: Path = Path("data/paper_trading.db")
+
+
+class Settings(PersistenceSettings):
+    """Full application settings sourced from environment variables or .env."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -42,9 +64,6 @@ class Settings(BaseSettings):
     nvidia_api_key: SecretStr | None = None
 
     nvidia_base_url: str | None = None
-
-    initial_paper_cash: float = Field(default=100_000, gt=0)
-    database_path: Path = Path("data/paper_trading.db")
 
     @field_validator("llm_provider", mode="before")
     @classmethod
@@ -129,3 +148,12 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Load and cache settings once per process."""
     return Settings()
+
+
+def get_persistence_settings() -> PersistenceSettings:
+    """Load storage settings without requiring any provider or API key.
+
+    Process environment variables take precedence over values in the project
+    root's .env, regardless of the current working directory.
+    """
+    return PersistenceSettings(_env_file=_project_root() / ".env")

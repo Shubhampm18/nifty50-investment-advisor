@@ -10,13 +10,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from nifty50_investment_advisor.config import (
+    DEFAULT_INITIAL_PAPER_CASH,
+    get_persistence_settings,
+)
 from nifty50_investment_advisor.database import (
     _connect,
     initialize_database,
 )
 
-DEFAULT_INITIAL_CASH = 1_000_000.00
+DEFAULT_INITIAL_CASH = DEFAULT_INITIAL_PAPER_CASH
 DEFAULT_PORTFOLIO_NAME = "My NIFTY 50 Portfolio"
+
+
+def get_default_initial_cash() -> float:
+    """Return the shared configured starting cash for a paper portfolio."""
+    return get_persistence_settings().initial_paper_cash
 
 
 def _now() -> str:
@@ -38,6 +47,16 @@ def _positive_amount(value: float, field: str) -> float:
         raise ValueError(f"{field} must be a finite positive number.")
 
     return amount
+
+
+def _transaction_cost_bps(value: float) -> float:
+    """Validate a user-entered simulated cost rate in basis points."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Transaction cost must be a number from 0 to 10,000 bps.")
+    rate = float(value)
+    if not math.isfinite(rate) or not 0 <= rate <= 10_000:
+        raise ValueError("Transaction cost must be a number from 0 to 10,000 bps.")
+    return rate
 
 
 def _clean_ticker(ticker: str) -> str:
@@ -65,12 +84,15 @@ def _transaction(
 
 def create_portfolio(
     name: str = DEFAULT_PORTFOLIO_NAME,
-    initial_cash: float = DEFAULT_INITIAL_CASH,
+    initial_cash: float | None = None,
     db_path: str | Path | None = None,
 ) -> int:
     """Create a virtual portfolio and return its ID."""
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Portfolio name cannot be empty.")
+
+    if initial_cash is None:
+        initial_cash = get_default_initial_cash()
 
     if isinstance(initial_cash, bool) or not isinstance(
         initial_cash, (int, float)
@@ -147,6 +169,7 @@ def create_trade_proposal(
     rationale: str,
     research_report_id: int | None = None,
     db_path: str | Path | None = None,
+    transaction_cost_bps: float = 0.0,
 ) -> int:
     """
     Submit a pending proposal. This function never executes a trade.
@@ -161,6 +184,7 @@ def create_trade_proposal(
 
     quantity = _positive_integer(quantity, "Quantity")
     proposed_price = _positive_amount(proposed_price, "Proposed price")
+    transaction_cost_bps = _transaction_cost_bps(transaction_cost_bps)
 
     if not isinstance(rationale, str) or not rationale.strip():
         raise ValueError("A non-empty rationale is required.")
@@ -206,9 +230,10 @@ def create_trade_proposal(
             """
             INSERT INTO trade_proposals (
                 portfolio_id, ticker, side, quantity, proposed_price,
-                status, rationale, research_report_id, created_at
+                transaction_cost_bps, status, rationale, research_report_id,
+                created_at
             )
-            VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
             """,
             (
                 portfolio_id,
@@ -216,6 +241,7 @@ def create_trade_proposal(
                 side,
                 quantity,
                 proposed_price,
+                transaction_cost_bps,
                 rationale.strip(),
                 research_report_id,
                 _now(),
@@ -333,6 +359,8 @@ def review_trade_proposal(
         quantity = int(proposal["quantity"])
         price = float(proposal["proposed_price"])
         total_value = round(quantity * price, 2)
+        fee_bps = float(proposal["transaction_cost_bps"])
+        fee_amount = round(total_value * fee_bps / 10_000, 2)
 
         holding = connection.execute(
             """
@@ -345,15 +373,18 @@ def review_trade_proposal(
 
         cash = round(float(portfolio["cash_balance"]), 2)
         trade_id: int
+        realized_pnl = 0.0
 
         if side == "BUY":
-            if cash + 1e-9 < total_value:
+            cash_required = round(total_value + fee_amount, 2)
+            if cash + 1e-9 < cash_required:
                 raise ValueError(
                     f"Insufficient cash: available ₹{cash:,.2f}, "
-                    f"required ₹{total_value:,.2f}."
+                    f"required ₹{cash_required:,.2f} including the "
+                    f"₹{fee_amount:,.2f} simulated cost."
                 )
 
-            new_cash = round(cash - total_value, 2)
+            new_cash = round(cash - cash_required, 2)
             old_quantity = int(holding["quantity"]) if holding else 0
             old_average_cost = (
                 float(holding["average_cost"]) if holding else 0.0
@@ -362,7 +393,8 @@ def review_trade_proposal(
             new_average_cost = round(
                 (
                     old_quantity * old_average_cost
-                    + quantity * price
+                    + total_value
+                    + fee_amount
                 ) / new_quantity,
                 4,
             )
@@ -403,7 +435,9 @@ def review_trade_proposal(
                 )
 
             remaining = int(holding["quantity"]) - quantity
-            new_cash = round(cash + total_value, 2)
+            new_cash = round(cash + total_value - fee_amount, 2)
+            average_cost = float(holding["average_cost"])
+            realized_pnl = round((price - average_cost) * quantity - fee_amount, 2)
 
             connection.execute(
                 """
@@ -436,9 +470,10 @@ def review_trade_proposal(
             """
             INSERT INTO paper_trades (
                 portfolio_id, proposal_id, ticker, side, quantity,
-                execution_price, total_value, executed_at
+                execution_price, total_value, fee_bps, fee_amount,
+                realized_pnl, executed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 proposal["portfolio_id"],
@@ -448,6 +483,9 @@ def review_trade_proposal(
                 quantity,
                 price,
                 total_value,
+                fee_bps,
+                fee_amount,
+                realized_pnl,
                 reviewed_at,
             ),
         )
@@ -474,6 +512,9 @@ def review_trade_proposal(
             "quantity": quantity,
             "execution_price": price,
             "total_value": total_value,
+            "transaction_cost_bps": fee_bps,
+            "fee_amount": fee_amount,
+            "realized_pnl": realized_pnl,
             "cash_balance": new_cash,
             "status": "APPROVED",
             "executed": True,
@@ -484,10 +525,9 @@ def get_portfolio_summary(
     portfolio_id: int,
     db_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Return cash, holdings, and basic portfolio totals.
+    """Return deterministic ledger totals, including realized P&L and fees.
 
-    Market value and unrealized profit/loss are intentionally omitted:
-    they require current market prices, not just average purchase costs.
+    Current market value is calculated separately from an explicit price refresh.
     """
     portfolio = get_portfolio(portfolio_id, db_path)
     if portfolio is None:
@@ -515,6 +555,41 @@ def get_portfolio_summary(
         invested_cost += item["cost_basis"]
         holdings.append(item)
 
+    with _connect(db_path) as connection:
+        trade_rows = connection.execute(
+            """
+            SELECT ticker, side, quantity, execution_price, fee_amount
+            FROM paper_trades
+            WHERE portfolio_id = ?
+            ORDER BY id
+            """,
+            (portfolio_id,),
+        ).fetchall()
+
+    positions: dict[str, dict[str, float]] = {}
+    realized_pnl = 0.0
+    total_fees = 0.0
+    for trade in trade_rows:
+        ticker = str(trade["ticker"])
+        state = positions.setdefault(ticker, {"quantity": 0.0, "average_cost": 0.0})
+        quantity = int(trade["quantity"])
+        price = float(trade["execution_price"])
+        fee = float(trade["fee_amount"])
+        total_fees += fee
+        if trade["side"] == "BUY":
+            old_quantity = state["quantity"]
+            new_quantity = old_quantity + quantity
+            state["average_cost"] = round((
+                old_quantity * state["average_cost"] + quantity * price + fee
+            ) / new_quantity, 4)
+            state["quantity"] = new_quantity
+        else:
+            realized_pnl += (price - state["average_cost"]) * quantity - fee
+            state["quantity"] -= quantity
+            if state["quantity"] <= 0:
+                state["quantity"] = 0.0
+                state["average_cost"] = 0.0
+
     return {
         "portfolio": portfolio,
         "cash_balance": round(float(portfolio["cash_balance"]), 2),
@@ -522,6 +597,8 @@ def get_portfolio_summary(
         "holdings_count": len(holdings),
         "invested_cost_basis": round(invested_cost, 2),
         "initial_cash": float(portfolio["initial_cash"]),
+        "realized_pnl": round(realized_pnl, 2),
+        "total_fees": round(total_fees, 2),
     }
 
 

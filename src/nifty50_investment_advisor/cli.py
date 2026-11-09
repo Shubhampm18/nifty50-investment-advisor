@@ -8,28 +8,33 @@ import json
 import sys
 from typing import Any
 
-
 from nifty50_investment_advisor.database import (
     get_research_report,
     initialize_database,
     list_research_reports,
     save_research_report,
+    save_stock_comparison,
 )
-
-
+from nifty50_investment_advisor.memory import (
+    clear_preferences,
+    has_saved_preferences,
+    read_preferences,
+)
 from nifty50_investment_advisor.portfolio import (
-    DEFAULT_INITIAL_CASH,
     DEFAULT_PORTFOLIO_NAME,
     create_portfolio,
     create_trade_proposal,
+    get_default_initial_cash,
     get_portfolio_summary,
     list_paper_trades,
     list_portfolios,
     list_trade_proposals,
     review_trade_proposal,
 )
-
-from nifty50_investment_advisor.research import run_research
+from nifty50_investment_advisor.research import (
+    run_research,
+    run_stock_comparison,
+)
 
 
 def _print_json(data: Any) -> None:
@@ -52,7 +57,7 @@ def _add_portfolio_commands(subparsers: Any) -> None:
     create_parser.add_argument(
         "--cash",
         type=float,
-        default=DEFAULT_INITIAL_CASH,
+        default=get_default_initial_cash(),
         help="Initial cash balance in INR.",
     )
 
@@ -83,6 +88,26 @@ def _add_portfolio_commands(subparsers: Any) -> None:
         "--save",
         action="store_true",
         help="Save the generated report to the local database.",
+    )
+
+    comparison_parser = subparsers.add_parser(
+        "compare",
+        help="Compare evidence for 2 to 5 current NIFTY 50 constituents.",
+    )
+    comparison_parser.add_argument(
+        "tickers",
+        nargs="+",
+        help="Current NSE symbols, with or without .NS, e.g. RELIANCE.NS TCS.",
+    )
+    comparison_parser.add_argument(
+        "--question",
+        default="Compare the available evidence for these stocks.",
+        help="Optional note saved with the comparison; the summary is deterministic.",
+    )
+    comparison_parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Save the completed typed comparison to the local database.",
     )
     
     research_list_parser = subparsers.add_parser(
@@ -143,6 +168,15 @@ def _add_portfolio_commands(subparsers: Any) -> None:
         type=float,
         required=True,
         help="Proposed price per share in INR.",
+    )
+    proposal_create_parser.add_argument(
+        "--cost-bps",
+        type=float,
+        default=0.0,
+        help=(
+            "User-supplied simulated transaction cost in basis points of notional "
+            "(default: 0; not a broker or tax estimate)."
+        ),
     )
     proposal_create_parser.add_argument(
         "--rationale",
@@ -221,6 +255,24 @@ def _add_portfolio_commands(subparsers: Any) -> None:
 
 
 
+def _add_memory_commands(subparsers: Any) -> None:
+    """Register commands for inspecting and deliberately clearing memory."""
+    subparsers.add_parser(
+        "memory-show",
+        help="Inspect saved user preferences.",
+    )
+    clear_parser = subparsers.add_parser(
+        "memory-clear",
+        help="Clear saved user preferences.",
+    )
+    clear_parser.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+        help="Confirm clearing the saved preferences.",
+    )
+
+
 def main() -> None:
     """Initialize the database and execute a CLI command."""
 
@@ -239,7 +291,28 @@ def main() -> None:
 
     subparsers = parser.add_subparsers(dest="command")
     _add_portfolio_commands(subparsers)
+    _add_memory_commands(subparsers)
     args = parser.parse_args()
+
+    if args.command == "memory-show":
+        try:
+            preferences = read_preferences()
+        except (OSError, ValueError) as exc:
+            parser.error(f"Could not inspect saved preferences: {exc}")
+
+        if has_saved_preferences(preferences):
+            print(preferences.rstrip())
+        else:
+            print("No saved preferences.")
+        return
+
+    if args.command == "memory-clear":
+        try:
+            clear_preferences()
+        except (OSError, ValueError) as exc:
+            parser.error(f"Could not clear saved preferences: {exc}")
+        print("Saved user preferences cleared.")
+        return
 
     try:
         initialize_database()
@@ -330,6 +403,34 @@ def main() -> None:
 
             print(f"\nResearch report saved with ID: {report_id}")
 
+    elif args.command == "compare":
+        try:
+            result = run_stock_comparison(args.tickers, args.question)
+        except (ValueError, TypeError) as exc:
+            parser.error(str(exc))
+        except Exception as exc:  # noqa: BLE001 - report configured service failures
+            parser.error(f"Comparison failed: {exc}")
+
+        print("\nStock comparison result:")
+        _print_json(result)
+        if not result.get("ok", False):
+            print(
+                "\nWARNING: Comparison analysis did not complete successfully. "
+                "Returned per-ticker evidence may still be partial.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+        if args.save:
+            report = result.get("report")
+            if not isinstance(report, dict):
+                parser.error("Comparison returned no valid report to save.")
+            try:
+                comparison_id = save_stock_comparison(report)
+            except Exception as exc:  # noqa: BLE001 - report persistence failures
+                parser.error(f"Could not save stock comparison: {exc}")
+            print(f"\nStock comparison saved with ID: {comparison_id}")
+
     
     elif args.command == "proposal-create":
         try:
@@ -341,6 +442,7 @@ def main() -> None:
                 proposed_price=args.price,
                 rationale=args.rationale,
                 research_report_id=args.report_id,
+                transaction_cost_bps=args.cost_bps,
             )
             print(f"Created trade proposal with ID: {proposal_id}")
             _print_json(

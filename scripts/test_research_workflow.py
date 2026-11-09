@@ -132,7 +132,7 @@ def main() -> int:
     print("Conclusion:", report.conclusion)
 
     print("\nUncertainties:")
-    for item in report.uncertainties:
+    for item in report.uncertainty:
         print(f"- {item}")
 
     print("\nRisks:")
@@ -142,7 +142,7 @@ def main() -> int:
     print("\nEvidence items:", len(report.evidence))
     for index, item in enumerate(report.evidence, start=1):
         print(f"\n{index}. {item.source_name}")
-        print("   Title:", item.title)
+        print("   Claim:", item.claim)
         print("   URL:", item.source_url)
         print("   Published:", item.published_at or "Unknown")
 

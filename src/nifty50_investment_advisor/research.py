@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -13,9 +15,13 @@ from urllib.parse import quote
 from nifty50_investment_advisor.agent import create_investment_agent
 from nifty50_investment_advisor.news_research import retrieve_news
 from nifty50_investment_advisor.reports import (
+    ComparisonDifference,
+    ComparisonObservation,
+    ComparisonTickerReport,
     EvidenceItem,
     ResearchData,
     ResearchReport,
+    StockComparisonReport,
 )
 from nifty50_investment_advisor.tools.fundamentals import (
     get_company_fundamentals,
@@ -24,7 +30,7 @@ from nifty50_investment_advisor.tools.market_data import get_market_data
 from nifty50_investment_advisor.tools.technical_indicators import (
     get_technical_indicators,
 )
-
+from nifty50_investment_advisor.universe import Nifty50Universe, get_nifty50_universe
 
 DISCLAIMER = (
     "This report is for educational and informational purposes only. "
@@ -34,7 +40,8 @@ DISCLAIMER = (
 )
 
 INDEX_TICKERS = {"^NSEI", "^NSEBANK", "^BSESN"}
-
+COMPARISON_MARKET_PERIOD = "1mo"
+COMPARISON_TECHNICAL_PERIOD = "6mo"
 TICKER_PATTERNS: list[tuple[tuple[str, ...], str]] = [
     (("bank nifty", "nifty bank"), "^NSEBANK"),
     (("sensex", "bse sensex"), "^BSESN"),
@@ -196,7 +203,11 @@ def _retrieve_tool(
         }
 
 
-def _retrieve_market_research(ticker: str) -> ResearchData:
+def _retrieve_market_research(
+    ticker: str,
+    market_period: str = COMPARISON_MARKET_PERIOD,
+    technical_period: str = COMPARISON_TECHNICAL_PERIOD,
+) -> ResearchData:
     """Retrieve market, technical, and applicable fundamental data."""
     data = ResearchData()
 
@@ -220,7 +231,7 @@ def _retrieve_market_research(ticker: str) -> ResearchData:
         get_market_data,
         {
             "symbol": ticker,
-            "period": "1mo",
+            "period": market_period,
             "interval": "1d",
         },
         ticker,
@@ -234,7 +245,7 @@ def _retrieve_market_research(ticker: str) -> ResearchData:
         get_technical_indicators,
         {
             "symbol": ticker,
-            "period": "6mo",
+            "period": technical_period,
         },
         ticker,
         "Technical indicators",
@@ -266,6 +277,320 @@ def _retrieve_market_research(ticker: str) -> ResearchData:
             data.retrieval_errors[name] = str(error)
 
     return data
+
+
+def normalize_comparison_tickers(
+    tickers: str | Sequence[str],
+    *,
+    universe: Nifty50Universe | None = None,
+) -> list[str]:
+    """Normalize symbols and validate membership in the current NIFTY 50."""
+    if isinstance(tickers, str):
+        candidates = re.split(r"[,\r\n]+", tickers)
+    elif isinstance(tickers, Sequence) and not isinstance(tickers, bytes):
+        candidates = list(tickers)
+    else:
+        raise TypeError("Supply 2 to 5 supported NSE stock tickers.")
+
+    current_universe = universe or get_nifty50_universe()
+    allowed = {item.yahoo_ticker for item in current_universe.constituents}
+    normalized: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            raise TypeError("Each comparison ticker must be text.")
+        symbol = candidate.strip().upper()
+        if not symbol:
+            raise ValueError("Comparison ticker entries cannot be empty.")
+        normalized.append(symbol if symbol.endswith(".NS") else f"{symbol}.NS")
+
+    if not 2 <= len(normalized) <= 5:
+        raise ValueError("A stock comparison requires 2 to 5 tickers.")
+
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("Comparison tickers must be distinct after normalization.")
+
+    unsupported = [
+        ticker for ticker in normalized
+        if ticker not in allowed
+    ]
+    if unsupported:
+        raise ValueError(
+            "Only current NIFTY 50 constituents can be compared. Unsupported: "
+            f"{', '.join(unsupported)}."
+        )
+
+    return normalized
+
+
+def _failed_comparison_data(ticker: str, error: str) -> ResearchData:
+    """Represent an unexpected per-ticker retrieval failure without dropping it."""
+    failed = {
+        "ok": False,
+        "symbol": ticker,
+        "error": error,
+    }
+    return ResearchData(
+        market_data=failed,
+        technical_indicators=failed,
+        fundamentals=failed,
+        retrieval_status={
+            "market_data": "failed",
+            "technical_indicators": "failed",
+            "fundamentals": "failed",
+            "news": "not_run",
+        },
+        retrieval_errors={
+            "market_data": error,
+            "technical_indicators": error,
+            "fundamentals": error,
+        },
+    )
+
+
+def _numeric_values(value: Any, prefix: str = "") -> dict[str, float]:
+    """Collect finite numeric evidence without interpreting text or booleans."""
+    if isinstance(value, bool):
+        return {}
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return {prefix: number} if prefix and math.isfinite(number) else {}
+    if not isinstance(value, dict):
+        return {}
+    collected: dict[str, float] = {}
+    for key, item in value.items():
+        name = f"{prefix}.{key}" if prefix else str(key)
+        collected.update(_numeric_values(item, name))
+    return collected
+
+
+def _comparison_differences(
+    stocks: list[ComparisonTickerReport],
+) -> list[ComparisonDifference]:
+    """Surface metrics returned for at least two tickers with source dates."""
+    category_sources = (
+        ("market_data", ("latest_close", "previous_close", "change_percent")),
+        ("technical_indicators", ("latest_close", "indicators")),
+        ("fundamentals", ("metrics",)),
+    )
+    differences: list[ComparisonDifference] = []
+
+    for category, selected_fields in category_sources:
+        by_metric: dict[str, list[ComparisonObservation]] = {}
+        for stock in stocks:
+            source_data = getattr(stock.report.data, category)
+            if not _result_succeeded(source_data):
+                continue
+
+            for selected in selected_fields:
+                value = source_data.get(selected)
+                prefix = selected if selected not in {"indicators", "metrics"} else ""
+                numeric = _numeric_values(value, prefix)
+                for metric, amount in numeric.items():
+                    source_name = str(
+                        source_data.get("source") or "Retrieved source"
+                    )
+                    as_of = source_data.get("latest_date")
+                    by_metric.setdefault(metric, []).append(
+                        ComparisonObservation(
+                            ticker=stock.ticker,
+                            value=amount,
+                            as_of=str(as_of) if as_of is not None else None,
+                            source_name=source_name,
+                        )
+                    )
+
+        for metric, observations in sorted(by_metric.items()):
+            if len(observations) >= 2:
+                differences.append(
+                    ComparisonDifference(
+                        category=category,
+                        metric=metric,
+                        observations=observations,
+                    )
+                )
+
+    return differences
+
+
+def _deterministic_comparison_summary(
+    stocks: list[ComparisonTickerReport],
+    differences: list[ComparisonDifference],
+) -> str:
+    """Describe fetched coverage and values without generating a ranking."""
+    lines = [
+        f"This comparison contains {len(stocks)} current NIFTY 50 constituents.",
+        "The summary lists returned values only; it does not rank stocks or select a winner.",
+    ]
+    for stock in stocks:
+        status = stock.report.data.retrieval_status
+        outcomes = ", ".join(
+            f"{name.replace('_', ' ')}: {status.get(name, 'unknown')}"
+            for name in ("market_data", "technical_indicators", "fundamentals", "news")
+        )
+        lines.append(f"{stock.ticker} retrieval status — {outcomes}.")
+
+    if differences:
+        lines.append("Returned numeric differences:")
+        for difference in differences[:12]:
+            values = "; ".join(
+                f"{item.ticker}: {item.value:.6g}"
+                + (f" (as of {item.as_of})" if item.as_of else " (date not provided)")
+                for item in difference.observations
+            )
+            lines.append(f"{difference.category}.{difference.metric}: {values}.")
+        if len(differences) > 12:
+            lines.append(
+                f"{len(differences) - 12} additional metrics are available in the table."
+            )
+    else:
+        lines.append(
+            "No numeric metric was returned successfully for at least two tickers."
+        )
+    return "\n".join(lines)[:5000]
+
+
+def run_stock_comparison(
+    tickers: str | Sequence[str],
+    research_question: str | None = None,
+) -> dict[str, Any]:
+    """Retrieve and compare evidence for 2-5 current NIFTY 50 constituents."""
+    universe = get_nifty50_universe()
+    normalized_tickers = normalize_comparison_tickers(tickers, universe=universe)
+    constituents_by_ticker = {
+        item.yahoo_ticker: item for item in universe.constituents
+    }
+    question = (research_question or "Compare the available evidence for these stocks.").strip()
+    if not question:
+        raise ValueError("Comparison question must not be empty.")
+    if len(question) > 2000:
+        raise ValueError("Comparison question must be 2000 characters or fewer.")
+
+    stocks: list[ComparisonTickerReport] = []
+    for ticker in normalized_tickers:
+        try:
+            data = _retrieve_market_research(
+                ticker,
+                market_period=COMPARISON_MARKET_PERIOD,
+                technical_period=COMPARISON_TECHNICAL_PERIOD,
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate ticker retrieval failures
+            error = f"{type(exc).__name__}: {exc}"
+            data = _failed_comparison_data(ticker, error)
+
+        data.retrieval_status["news"] = "not_run"
+        constituent = constituents_by_ticker[ticker]
+        news_query = (
+            f"{constituent.company_name} ({constituent.symbol}) "
+            "stock India latest news"
+        )
+        try:
+            news = retrieve_news(news_query)
+            if not isinstance(news, dict):
+                raise TypeError("News retrieval returned an unexpected result type.")
+        except Exception as exc:  # noqa: BLE001 - retain ticker-specific news failures
+            news = {
+                "ok": False,
+                "query": news_query,
+                "articles": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        if news.get("ok") is True:
+            data.retrieval_status["news"] = "success"
+        else:
+            data.retrieval_status["news"] = "failed"
+            news_error = str(news.get("error", "News retrieval failed."))
+            data.retrieval_errors["news"] = news_error
+
+        data.comparison_periods = {
+            "market_data": COMPARISON_MARKET_PERIOD,
+            "technical_indicators": COMPARISON_TECHNICAL_PERIOD,
+        }
+        individual = _build_research_report(
+            question=f"Per-ticker evidence for {ticker}: {question}",
+            analysis=(
+                f"Evidence record for {ticker}. Review this ticker's returned "
+                "data, source timestamps, retrieval status, and missing fields "
+                "alongside the comparison summary."
+            ),
+            news=news,
+            data=data,
+            ticker=ticker,
+        )
+        if not individual.company_name:
+            individual.company_name = constituent.company_name
+        if data.retrieval_status.get("news") == "failed":
+            individual.missing_information.append(
+                "Company-specific news retrieval failed: "
+                + data.retrieval_errors["news"]
+            )
+        if data.retrieval_status.get("fundamentals") == "success":
+            fundamentals = data.fundamentals or {}
+            if not fundamentals.get("as_of") and not fundamentals.get("latest_date"):
+                individual.missing_information.append(
+                    "Fundamentals response did not include an as-of timestamp."
+                )
+        stocks.append(
+            ComparisonTickerReport(
+                ticker=ticker,
+                company_name=constituent.company_name,
+                report=individual,
+                news=news,
+            )
+        )
+
+    differences = _comparison_differences(stocks)
+    analysis = _deterministic_comparison_summary(stocks, differences)
+
+    missing = [
+        f"{stock.ticker}: {item}"
+        for stock in stocks
+        for item in stock.report.missing_information
+    ]
+    report = StockComparisonReport(
+        research_question=question,
+        universe_checked_at=universe.checked_at,
+        universe_stale=universe.stale,
+        tickers=normalized_tickers,
+        stocks=stocks,
+        summary=analysis,
+        differences=differences,
+        uncertainty=[
+            (
+                "The same market-data and technical lookback periods were requested "
+                "for every ticker, but providers may return different observation dates."
+            ),
+            "Available values and news coverage can be incomplete, delayed, or revised.",
+            (
+                "Numeric differences describe returned data and do not establish that one "
+                "stock is a better investment."
+            ),
+        ],
+        missing_information=missing,
+        conclusion=(
+            "This comparison summarizes evidence returned separately for each "
+            "ticker. It does not rank stocks or make a trade decision. Review "
+            "the per-ticker retrieval status, timestamps, missing information, "
+            "and source limitations."
+        ),
+        disclaimer=DISCLAIMER,
+    )
+    has_successful_evidence = any(
+        any(value == "success" for value in stock.report.data.retrieval_status.values())
+        for stock in stocks
+    )
+    return {
+        "ok": has_successful_evidence,
+        "tickers": normalized_tickers,
+        "analysis": analysis,
+        "error": (
+            None
+            if has_successful_evidence
+            else "No market, technical, fundamentals, or news evidence was retrieved successfully."
+        ),
+        "agent_error": None,
+        "report": report.model_dump(mode="json"),
+    }
 
 
 def _build_market_context(data: ResearchData) -> str:
@@ -353,7 +678,8 @@ def _build_research_report(
         )
         claim = (
             f"Technical indicators for {ticker} as of "
-            f"{technical.get('latest_date')}: {indicator_summary or 'no indicator values returned'}."
+            f"{technical.get('latest_date')}: "
+            f"{indicator_summary or 'no indicator values returned'}."
         )
         evidence.append(
             EvidenceItem(
